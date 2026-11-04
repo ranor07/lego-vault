@@ -134,6 +134,7 @@ label.f .sub{font-weight:400;color:var(--muted)}
 .err{color:var(--chip-missing-ink);background:var(--chip-missing);border-radius:10px;padding:8px 12px;font-size:14px}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(var(--tabh) + 90px + env(safe-area-inset-bottom,0px));z-index:30;background:var(--ink);color:var(--bg);padding:10px 18px;border-radius:12px;font-weight:600;max-width:calc(100% - 32px);text-align:center}
 .linkbox{font-family:var(--mono);font-size:13px;background:var(--bg);border:2px solid var(--line);border-radius:10px;padding:10px;overflow-wrap:anywhere;user-select:all;-webkit-user-select:all}
+@media (max-width:430px){h1{font-size:24px}.hbtn{padding:0 8px}.count{padding:4px 7px;font-size:12px}.hrow{gap:7px}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
@@ -143,6 +144,7 @@ label.f .sub{font-weight:400;color:var(--muted)}
     <h1>Lego Vault</h1>
     <span class="count" id="count">0 sets</span>
     <button class="hbtn" id="backupbtn" type="button">Backup</button>
+    <button class="hbtn" id="syncbtn" type="button" hidden>Sign in</button>
   </div>
 </header>
 
@@ -298,8 +300,41 @@ label.f .sub{font-weight:400;color:var(--muted)}
   </div>
 </div>
 
+<div class="sheet" id="syncsheet" hidden role="dialog" aria-modal="true" aria-labelledby="stitle">
+  <div class="sheethead"><button class="xbtn" id="sclose" type="button">← Back</button><h2 id="stitle">Online vault</h2></div>
+  <div class="sheetbody">
+    <div class="card" style="margin:0" id="signinbox">
+      <h3>Sign in</h3>
+      <p>Sign in to save your sets online. Then your iPhone and iPad show the same sets, and nothing gets lost.</p>
+      <form id="signinform" style="display:flex;flex-direction:column;gap:12px" autocomplete="on">
+        <label class="f">Email<input class="inp" id="semail" type="email" autocomplete="username" autocapitalize="off" spellcheck="false"></label>
+        <label class="f">Password<input class="inp" id="spass" type="password" autocomplete="current-password"></label>
+        <div class="err" id="serr" hidden></div>
+        <button class="bigbtn b-red" id="sgo" type="submit">Sign in</button>
+      </form>
+      <p class="hint" style="margin:12px 0 0">No login? Ask Dad. Without signing in, Lego Vault still works and saves on this device only.</p>
+    </div>
+    <div class="card" style="margin:0" id="signedbox" hidden>
+      <h3>☁️ Your vault is online</h3>
+      <p>Signed in as <b id="semailshow"></b>. New sets save online automatically and show up on all your devices.</p>
+      <div id="movebox" hidden style="display:flex;flex-direction:column;gap:10px;margin-bottom:12px">
+        <p class="hint" style="margin:0" id="movetext"></p>
+        <button class="bigbtn b-blue" id="movebtn" type="button">Move them to my online vault</button>
+      </div>
+      <button class="bigbtn b-ghost" id="signout" type="button">Sign out</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast" hidden></div>
 
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script>
+/* Firebase settings for the online vault. null = online saving is off. */
+const FIREBASE_CONFIG = null;
+</script>
 <script>
 (function(){
 const THEMES=["Star Wars","City","Technic","Ninjago","Friends","Creator 3-in-1","Harry Potter","Marvel","DC","Minecraft","Speed Champions","Icons","Ideas","Super Mario","Jurassic World","Architecture","Duplo","Classic","Disney","Dreamzzz","Sonic","Monkie Kid","Botanicals","Other"];
@@ -334,9 +369,36 @@ async function tx(mode,fn){
     t.oncomplete=()=>res(out);t.onerror=()=>rej(t.error);t.onabort=()=>rej(t.error);
   });
 }
-const loadAll=()=>tx("readonly",st=>st.getAll());
-const putSet=s=>tx("readwrite",st=>st.put(s));
-const delSet=id=>tx("readwrite",st=>st.delete(id));
+const localAll=()=>tx("readonly",st=>st.getAll());
+const localPut=s=>tx("readwrite",st=>st.put(s));
+const localDel=id=>tx("readwrite",st=>st.delete(id));
+
+/* ---------- Online vault (Firebase) ---------- */
+let fb=null,cloudCol=null,unsub=null,cloudReady=false;
+function cloudErr(e){
+  const c=e&&e.code||"";
+  toast(c.includes("permission")?"Online vault said no. Try signing out and in again.":"Couldn't save online. It will try again when there's internet.");
+}
+async function reshrinkDataUrl(url,max){
+  const img=await new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url});
+  const sc=Math.min(1,max/Math.max(img.naturalWidth,img.naturalHeight));
+  const c=document.createElement("canvas");c.width=Math.round(img.naturalWidth*sc);c.height=Math.round(img.naturalHeight*sc);
+  c.getContext("2d").drawImage(img,0,0,c.width,c.height);return c.toDataURL("image/jpeg",0.75);
+}
+async function fitPhoto(s){
+  if(!s.photo||s.photo.length<700000)return s;
+  let p=s.photo;
+  for(const m of [1000,800,600]){try{p=await reshrinkDataUrl(p,m)}catch{return Object.assign({},s,{photo:null})}if(p.length<700000)break}
+  return Object.assign({},s,{photo:p.length<900000?p:null});
+}
+async function putSet(s){
+  if(cloudCol){const f=await fitPhoto(s);cloudCol.doc(f.id).set(f).catch(cloudErr);return}
+  return localPut(s);
+}
+async function delSet(id){
+  if(cloudCol){cloudCol.doc(id).delete().catch(cloudErr);return}
+  return localDel(id);
+}
 const newId=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,8);
 
 function toast(msg){const t=$("#toast");t.textContent=msg;t.hidden=false;clearTimeout(toast._t);toast._t=setTimeout(()=>t.hidden=true,2400)}
@@ -376,7 +438,7 @@ function render(){
 $("#q").addEventListener("input",render);
 $("#themechips").addEventListener("click",e=>{const b=e.target.closest(".fchip");if(b){filter=b.dataset.t;render()}});
 $("#list").addEventListener("click",e=>{const b=e.target.closest(".row");if(b)openDetail(b.dataset.id)});
-async function refresh(){sets=(await loadAll())||[];render()}
+async function refresh(){if(cloudCol)return;const l=(await localAll())||[];if(cloudCol)return;sets=l;render()}
 
 /* ---------- Detail ---------- */
 function openDetail(id){
@@ -483,7 +545,7 @@ $("#copybtn").onclick=copyLink;
 function daysSince(t){return t?Math.floor((Date.now()-+t)/86400000):null}
 function updateBackupNote(){
   const last=lsGet("lv-backup"),changed=lsGet("lv-changed");
-  const need=sets.length>0&&(!last||(changed&&+changed>+last&&daysSince(last)>=7)||(!last&&sets.length>=3));
+  const need=!cloudCol&&sets.length>0&&(!last||(changed&&+changed>+last&&daysSince(last)>=7)||(!last&&sets.length>=3));
   $("#backupnote").hidden=!need;
   $("#backupnoteText").textContent=last?`Last backup was ${daysSince(last)} days ago. Time for a new one!`:"You haven't made a backup yet. Tap here to keep your sets safe.";
   $("#lastbackup").textContent=last?`Last backup: ${new Date(+last).toLocaleDateString()}`:"No backup yet.";
@@ -493,7 +555,7 @@ $("#backupbtn").onclick=()=>openBackup();
 function openBackup(){$("#berr").hidden=true;updateBackupNote();$("#backupsheet").hidden=false}
 $("#bclose").onclick=()=>$("#backupsheet").hidden=true;
 $("#dobackup").onclick=async()=>{
-  const all=(await loadAll())||[];
+  const all=cloudCol?sets.slice():((await localAll())||[]);
   const json=JSON.stringify({app:"lego-vault",version:1,saved:new Date().toISOString(),sets:all});
   const name="lego-vault-backup-"+new Date().toISOString().slice(0,10)+".json";
   const file=new File([json],name,{type:"application/json"});
@@ -518,7 +580,69 @@ $("#restorein").addEventListener("change",async e=>{
   }catch{er.textContent="That file isn't a Lego Vault backup. Pick the file that starts with lego-vault-backup.";er.hidden=false}
 });
 
+/* ---------- Sign in / online sync ---------- */
+function openSync(){$("#serr").hidden=true;updateMoveBox();$("#syncsheet").hidden=false}
+$("#syncbtn").onclick=openSync;
+$("#sclose").onclick=()=>$("#syncsheet").hidden=true;
+async function updateMoveBox(){
+  if(!cloudCol){$("#movebox").hidden=true;return}
+  let local=[];try{local=(await localAll())||[]}catch{}
+  $("#movebox").hidden=local.length===0;
+  $("#movetext").textContent=`This device still has ${local.length} set${local.length===1?"":"s"} saved only here.`;
+}
+$("#movebtn").onclick=async()=>{
+  const b=$("#movebtn");b.disabled=true;b.textContent="Moving…";
+  let n=0;
+  try{
+    const local=(await localAll())||[];
+    for(const s of local){const f=await fitPhoto(s);await cloudCol.doc(f.id).set(f);await localDel(s.id);n++}
+    toast(n+" sets moved online!");
+  }catch{toast("Moved "+n+". Check the internet and tap again for the rest.")}
+  b.disabled=false;b.textContent="Move them to my online vault";updateMoveBox();
+};
+$("#signinform").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const er=$("#serr");er.hidden=true;
+  const email=$("#semail").value.trim(),pw=$("#spass").value;
+  if(!email||!pw){er.textContent="Type the email and the password.";er.hidden=false;return}
+  const b=$("#sgo");b.disabled=true;b.textContent="Signing in…";
+  try{await fb.auth().signInWithEmailAndPassword(email,pw);$("#spass").value=""}
+  catch(x){
+    const c=x&&x.code||"";
+    er.textContent=c.includes("network")?"No internet. Connect to Wi-Fi and try again.":c.includes("too-many")?"Too many tries. Wait a few minutes, then try again.":"That email or password isn't right. Check with Dad.";
+    er.hidden=false;
+  }finally{b.disabled=false;b.textContent="Sign in"}
+});
+$("#signout").onclick=()=>{fb.auth().signOut();$("#syncsheet").hidden=true;toast("Signed out")};
+function setUser(u){
+  if(unsub){unsub();unsub=null}
+  if(u){
+    cloudCol=fb.firestore().collection("users").doc(u.uid).collection("sets");
+    $("#syncbtn").textContent="☁️";$("#syncbtn").setAttribute("aria-label","Online vault: signed in");
+    $("#semailshow").textContent=u.email||"";
+    $("#signinbox").hidden=true;$("#signedbox").hidden=false;
+    unsub=cloudCol.onSnapshot(snap=>{sets=snap.docs.map(d=>Object.assign({},d.data(),{id:d.id}));render()},
+      e=>{cloudErr(e)});
+    updateMoveBox();
+  }else{
+    cloudCol=null;
+    $("#syncbtn").textContent="Sign in";$("#syncbtn").setAttribute("aria-label","Sign in to the online vault");
+    $("#signinbox").hidden=false;$("#signedbox").hidden=true;
+    refresh();
+  }
+}
+function startCloud(){
+  if(!FIREBASE_CONFIG||!window.firebase)return;
+  try{
+    fb=firebase;fb.initializeApp(FIREBASE_CONFIG);
+    fb.firestore().enablePersistence({synchronizeTabs:true}).catch(()=>{});
+    $("#syncbtn").hidden=false;
+    fb.auth().onAuthStateChanged(setUser);
+  }catch{}
+}
+
 /* ---------- Start ---------- */
+startCloud();
 if(!isStandalone&&lsGet("lv-hidetip")!=="1")$("#homenote").hidden=false;
 $("#homenoteX").onclick=()=>{$("#homenote").hidden=true;lsSet("lv-hidetip","1")};
 if(navigator.storage&&navigator.storage.persist){navigator.storage.persist().catch(()=>{})}
